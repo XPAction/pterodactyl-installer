@@ -6,7 +6,7 @@ set -e
 #                                                                                    #
 # Project 'pterodactyl-installer'                                                    #
 #                                                                                    #
-# Copyright (C) 2018 - 2023, Vilhelm Prytz, <vilhelm@prytznet.se>                    #
+# Copyright (C) 2018 - 2026, Vilhelm Prytz, <vilhelm@prytznet.se>                    #
 #                                                                                    #
 #   This program is free software: you can redistribute it and/or modify             #
 #   it under the terms of the GNU General Public License as published by             #
@@ -52,7 +52,7 @@ fail() {
   echo -n "* Proceed anyways (your install will be broken if you do not know what you are doing)? (y/N): "
   read -r override
 
-  [[ ! "$override" =~ [Yy] ]] && error "Invalid FQDN or DNS record" && exit 1
+  ! is_yes "$override" && error "Invalid FQDN or DNS record" && exit 1
   return 0
 }
 
@@ -79,22 +79,22 @@ confirm() {
 
   echo -e -n "* I agree that this HTTPS request is performed (y/N): "
   read -r confirm
-  [[ "$confirm" =~ [Yy] ]] || (error "User did not agree" && false)
+  is_yes "$confirm" || (error "User did not agree" && false)
 }
 
 dns_verify() {
   output "Resolving DNS for $fqdn"
-  ip=$(curl -4 -s $CHECKIP_URL)
+  ip=$(curl -4 -fsSL "$CHECKIP_URL")
   dns_record=$(dig +short @$DNS_SERVER "$fqdn" | tail -n1)
-  [ "${ip}" != "${dns_record}" ] && fail
+  [ -n "$ip" ] && [ -n "$dns_record" ] && [ "$ip" == "$dns_record" ] || fail
   output "DNS verified!"
 }
 
 main() {
   fqdn="$1"
   dep_install
-  confirm && dns_verify
-  true
+  confirm || return 1
+  dns_verify
 }
 
-main "$1" "$2"
+main "$1"

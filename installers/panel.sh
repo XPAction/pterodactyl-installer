@@ -1,12 +1,12 @@
 #!/bin/bash
 
-set -e
+set -e -o pipefail
 
 ######################################################################################
 #                                                                                    #
 # Project 'pterodactyl-installer'                                                    #
 #                                                                                    #
-# Copyright (C) 2018 - 2023, Vilhelm Prytz, <vilhelm@prytznet.se>                    #
+# Copyright (C) 2018 - 2026, Vilhelm Prytz, <vilhelm@prytznet.se>                    #
 #                                                                                    #
 #   This program is free software: you can redistribute it and/or modify             #
 #   it under the terms of the GNU General Public License as published by             #
@@ -48,6 +48,7 @@ MYSQL_PASSWORD="${MYSQL_PASSWORD:-$(gen_passwd 64)}"
 
 # Environment
 timezone="${timezone:-Europe/Stockholm}"
+telemetry="${telemetry:-true}"
 
 # Assume SSL, will fetch different config if true
 ASSUME_SSL="${ASSUME_SSL:-false}"
@@ -64,41 +65,42 @@ user_firstname="${user_firstname:-}"
 user_lastname="${user_lastname:-}"
 user_password="${user_password:-}"
 
-if [[ -z "${email}" ]]; then
-  error "Email is required"
+missing=()
+
+for var in email user_email user_username user_firstname user_lastname user_password; do
+  if [[ -z "${!var}" ]]; then
+    missing+=("$var")
+  fi
+done
+
+if (( ${#missing[@]} > 0 )); then
+  for m in "${missing[@]}"; do
+    error "${m} is required"
+  done
   exit 1
 fi
 
-if [[ -z "${user_email}" ]]; then
-  error "User email is required"
+validate_panel_version
+valid_database_identifier "$MYSQL_DB"
+valid_database_identifier "$MYSQL_USER"
+valid_panel_database_password "$MYSQL_PASSWORD"
+valid_admin_username "$user_username"
+valid_admin_name "$user_firstname"
+valid_admin_name "$user_lastname"
+valid_admin_password "$user_password"
+valid_hostname "$FQDN"
+if [ -d /var/www/pterodactyl ]; then
+  error "An existing Panel installation was detected. This script only supports fresh installations."
+  output "Upgrade guide: https://docs.pterodactyl.io/v2/upgrading/upgrading-from-v1"
   exit 1
 fi
-
-if [[ -z "${user_username}" ]]; then
-  error "User username is required"
-  exit 1
-fi
-
-if [[ -z "${user_firstname}" ]]; then
-  error "User firstname is required"
-  exit 1
-fi
-
-if [[ -z "${user_lastname}" ]]; then
-  error "User lastname is required"
-  exit 1
-fi
-
-if [[ -z "${user_password}" ]]; then
-  error "User password is required"
-  exit 1
-fi
+get_latest_versions panel
 
 # --------- Main installation functions -------- #
 
 install_composer() {
   output "Installing composer.."
-  curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+  curl -fsSL https://getcomposer.org/installer | "$PHP_BIN" -- --2 --install-dir=/usr/local/bin --filename=composer
   success "Composer installed!"
 }
 
@@ -107,8 +109,13 @@ ptdl_dl() {
   mkdir -p /var/www/pterodactyl
   cd /var/www/pterodactyl || exit
 
-  curl -Lo panel.tar.gz "$PANEL_DL_URL"
-  tar -xzvf panel.tar.gz
+  output "Installing Panel $PTERODACTYL_PANEL_VERSION"
+  curl -fLo panel.tar.gz "$PANEL_DL_URL"
+  if [ "$PANEL_MAJOR_VERSION" == "2" ]; then
+    tar -xzvf panel.tar.gz --strip-components=1
+  else
+    tar -xzvf panel.tar.gz
+  fi
   chmod -R 755 storage/* bootstrap/cache/
 
   cp .env.example .env
@@ -118,9 +125,17 @@ ptdl_dl() {
 
 install_composer_deps() {
   output "Installing composer dependencies.."
-  [ "$OS" == "rocky" ] || [ "$OS" == "almalinux" ] && export PATH=/usr/local/bin:$PATH
-  COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader
+  export COMPOSER_ALLOW_SUPERUSER=1
+  "$PHP_BIN" /usr/local/bin/composer install --no-dev --optimize-autoloader
+  "$PHP_BIN" /usr/local/bin/composer check-platform-reqs --no-dev
   success "Installed composer dependencies!"
+
+  if [ "$PANEL_MAJOR_VERSION" == "2" ]; then
+    output "Building Panel v2 frontend.."
+    npm ci --include=dev
+    npm run build:production
+    success "Built Panel frontend!"
+  fi
 }
 
 # Configure environment
@@ -132,10 +147,10 @@ configure() {
   [ "$CONFIGURE_LETSENCRYPT" == true ] && app_url="https://$FQDN"
 
   # Generate encryption key
-  php artisan key:generate --force
+  "$PHP_BIN" artisan key:generate --force
 
   # Fill in environment:setup automatically
-  php artisan p:environment:setup \
+  "$PHP_BIN" artisan p:environment:setup \
     --author="$email" \
     --url="$app_url" \
     --timezone="$timezone" \
@@ -145,10 +160,11 @@ configure() {
     --redis-host="localhost" \
     --redis-pass="null" \
     --redis-port="6379" \
+    --telemetry="$telemetry" \
     --settings-ui=true
 
   # Fill in environment:database credentials automatically
-  php artisan p:environment:database \
+  "$PHP_BIN" artisan p:environment:database \
     --host="127.0.0.1" \
     --port="3306" \
     --database="$MYSQL_DB" \
@@ -156,10 +172,10 @@ configure() {
     --password="$MYSQL_PASSWORD"
 
   # configures database
-  php artisan migrate --seed --force
+  "$PHP_BIN" artisan migrate --seed --force
 
   # Create user account
-  php artisan p:user:make \
+  "$PHP_BIN" artisan p:user:make \
     --email="$user_email" \
     --username="$user_username" \
     --name-first="$user_firstname" \
@@ -186,10 +202,18 @@ set_folder_permissions() {
 insert_cronjob() {
   output "Installing cronjob.. "
 
-  crontab -l | {
-    cat
-    output "* * * * php /var/www/pterodactyl/artisan schedule:run >> /dev/null 2>&1"
+  {
+    crontab -l 2>/dev/null || true
+    echo "* * * * * $PHP_BIN /var/www/pterodactyl/artisan schedule:run >> /dev/null 2>&1"
   } | crontab -
+  case "$OS" in
+  ubuntu | debian)
+    systemctl enable --now cron
+    ;;
+  rocky | almalinux)
+    systemctl enable --now crond
+    ;;
+  esac
 
   success "Cronjob installed!"
 }
@@ -197,7 +221,8 @@ insert_cronjob() {
 install_pteroq() {
   output "Installing pteroq service.."
 
-  curl -o /etc/systemd/system/pteroq.service "$GITHUB_URL"/configs/pteroq.service
+  curl -fsSL -o /etc/systemd/system/pteroq.service "$GITHUB_URL"/configs/pteroq.service
+  sed -i -e "s@redis-server.service@${CACHE_SERVICE}.service@g" -e "s@/usr/bin/php @$PHP_BIN @g" /etc/systemd/system/pteroq.service
 
   case "$OS" in
   debian | ubuntu)
@@ -208,6 +233,7 @@ install_pteroq() {
     ;;
   esac
 
+  systemctl daemon-reload
   systemctl enable pteroq.service
   systemctl start pteroq
 
@@ -217,14 +243,10 @@ install_pteroq() {
 # -------- OS specific install functions ------- #
 
 enable_services() {
+  systemctl enable --now "$CACHE_SERVICE"
   case "$OS" in
   ubuntu | debian)
-    systemctl enable redis-server
-    systemctl start redis-server
-    ;;
-  rocky | almalinux)
-    systemctl enable redis
-    systemctl start redis
+    systemctl enable --now php8.3-fpm
     ;;
   esac
   systemctl enable nginx
@@ -239,7 +261,7 @@ selinux_allow() {
 }
 
 php_fpm_conf() {
-  curl -o /etc/php-fpm.d/www-pterodactyl.conf "$GITHUB_URL"/configs/www-pterodactyl.conf
+  curl -fsSL -o /etc/php-fpm.d/www-pterodactyl.conf "$GITHUB_URL"/configs/www-pterodactyl.conf
 
   systemctl enable php-fpm
   systemctl start php-fpm
@@ -251,31 +273,38 @@ ubuntu_dep() {
 
   # Add Ubuntu universe repo
   add-apt-repository universe -y
-
-  # Add the MariaDB repo (bionic has mariadb version 10.1 and we need newer than that)
-  [ "$OS_VER_MAJOR" == "18" ] && curl -sS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | bash
-
-  # Add PPA for PHP (we need 8.1)
-  LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php
+  case "$OS_VER_MAJOR" in
+  22)
+    LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php
+    ;;
+  26)
+    debian_dep # Sury also provides PHP 8.3 packages for Ubuntu 26.04.
+    ;;
+  esac
 }
 
 debian_dep() {
   # Install deps for adding repos
-  install_packages "dirmngr ca-certificates apt-transport-https lsb-release"
+  install_packages "dirmngr ca-certificates apt-transport-https lsb-release gnupg"
 
-  # Install PHP 8.1 using sury's repo
-  curl -o /etc/apt/trusted.gpg.d/php.gpg https://packages.sury.org/php/apt.gpg
-  echo "deb https://packages.sury.org/php/ $(lsb_release -sc) main" | tee /etc/apt/sources.list.d/php.list
+  # Install PHP 8.3 using sury's repo
+  mkdir -p /etc/apt/keyrings
+  curl -fsSL https://packages.sury.org/php/apt.gpg | gpg --dearmor --yes -o /etc/apt/keyrings/php.gpg
+  echo "deb [signed-by=/etc/apt/keyrings/php.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" | tee /etc/apt/sources.list.d/php.list
 }
 
 alma_rocky_dep() {
   # SELinux tools
-  install_packages "policycoreutils selinux-policy selinux-policy-targeted \
-    setroubleshoot-server setools setools-console mcstrans"
+  install_packages "policycoreutils selinux-policy selinux-policy-targeted epel-release"
 
-  # add remi repo (php8.1)
-  install_packages "epel-release http://rpms.remirepo.net/enterprise/remi-release-$OS_VER_MAJOR.rpm"
-  dnf module enable -y php:remi-8.1
+  # add remi repo (php8.3)
+  if [ "$OS_VER_MAJOR" != "10" ]; then
+    install_packages "https://rpms.remirepo.net/enterprise/remi-release-$OS_VER_MAJOR.rpm"
+    dnf module enable -y php:remi-8.3
+    if ! command -v mariadbd >/dev/null 2>&1; then
+      dnf module enable -y mariadb:10.11
+    fi
+  fi
 }
 
 dep_install() {
@@ -288,13 +317,19 @@ dep_install() {
 
   case "$OS" in
   ubuntu | debian)
-    [ "$OS" == "ubuntu" ] && ubuntu_dep
-    [ "$OS" == "debian" ] && debian_dep
+    if [ "$OS" == "ubuntu" ]; then
+      ubuntu_dep
+      if [ "$OS_VER_MAJOR" == "22" ] && ! command -v mariadbd >/dev/null 2>&1; then
+        curl -fsSL "$MARIADB_URL" | bash -s -- --mariadb-server-version=mariadb-10.11 --skip-maxscale --skip-tools
+      fi
+    else
+      debian_dep
+    fi
 
     update_repos
 
     # Install dependencies
-    install_packages "php8.1 php8.1-{cli,common,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip} \
+    install_packages "php8.3 php8.3-{cli,common,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip,intl} \
       mariadb-common mariadb-server mariadb-client \
       nginx \
       redis-server \
@@ -308,10 +343,10 @@ dep_install() {
     alma_rocky_dep
 
     # Install dependencies
-    install_packages "php php-{common,fpm,cli,json,mysqlnd,mcrypt,gd,mbstring,pdo,zip,bcmath,dom,opcache,posix} \
+    install_packages "php php-{common,fpm,cli,mysqlnd,gd,mbstring,pdo,zip,bcmath,xml,opcache,process,sodium,intl} \
       mariadb mariadb-server \
       nginx \
-      redis \
+      $CACHE_SERVICE \
       zip unzip tar \
       git cronie"
 
@@ -325,6 +360,19 @@ dep_install() {
     ;;
   esac
 
+  local setup_url
+  if [ "$PANEL_MAJOR_VERSION" == "2" ]; then
+    case "$OS" in
+    ubuntu | debian)
+      setup_url="https://deb.nodesource.com/setup_22.x"
+      ;;
+    rocky | almalinux)
+      setup_url="https://rpm.nodesource.com/setup_22.x"
+      ;;
+    esac
+    curl -fsSL "$setup_url" | bash -
+    install_packages "nodejs"
+  fi
   enable_services
 
   success "Dependencies installed!"
@@ -354,13 +402,17 @@ letsencrypt() {
     echo -n "* Still assume SSL? (y/N): "
     read -r CONFIGURE_SSL
 
-    if [[ "$CONFIGURE_SSL" =~ [Yy] ]]; then
+    if is_yes "$CONFIGURE_SSL"; then
       ASSUME_SSL=true
       CONFIGURE_LETSENCRYPT=false
       configure_nginx
     else
       ASSUME_SSL=false
       CONFIGURE_LETSENCRYPT=false
+      sed -i "s@^APP_URL=.*@APP_URL=http://$FQDN@" .env
+      "$PHP_BIN" artisan config:clear
+      "$PHP_BIN" artisan queue:restart
+      configure_nginx
     fi
   else
     success "The process of obtaining a Let's Encrypt certificate succeeded!"
@@ -380,7 +432,7 @@ configure_nginx() {
 
   case "$OS" in
   ubuntu | debian)
-    PHP_SOCKET="/run/php/php8.1-fpm.sock"
+    PHP_SOCKET="/run/php/php8.3-fpm.sock"
     CONFIG_PATH_AVAIL="/etc/nginx/sites-available"
     CONFIG_PATH_ENABL="/etc/nginx/sites-enabled"
     ;;
@@ -393,11 +445,20 @@ configure_nginx() {
 
   rm -rf "$CONFIG_PATH_ENABL"/default
 
-  curl -o "$CONFIG_PATH_AVAIL"/pterodactyl.conf "$GITHUB_URL"/configs/$DL_FILE
+  curl -fsSL -o "$CONFIG_PATH_AVAIL"/pterodactyl.conf "$GITHUB_URL"/configs/$DL_FILE
 
   sed -i -e "s@<domain>@${FQDN}@g" "$CONFIG_PATH_AVAIL"/pterodactyl.conf
 
   sed -i -e "s@<php_socket>@${PHP_SOCKET}@g" "$CONFIG_PATH_AVAIL"/pterodactyl.conf
+  if [ "$PANEL_MAJOR_VERSION" == "2" ]; then
+    # ^~ prevents asset paths from falling through to the PHP handler.
+    # shellcheck disable=SC2016
+    sed -i '/    location ~ \\.php\$ {/i\
+    location ^~ /assets/ {\n\
+        location ~ /\\. { deny all; }\n\
+        try_files $uri =404;\n\
+    }\n' "$CONFIG_PATH_AVAIL"/pterodactyl.conf
+  fi
 
   case "$OS" in
   ubuntu | debian)
@@ -406,6 +467,7 @@ configure_nginx() {
   esac
 
   if [ "$ASSUME_SSL" == false ] && [ "$CONFIGURE_LETSENCRYPT" == false ]; then
+    nginx -t
     systemctl restart nginx
   fi
 
@@ -417,6 +479,7 @@ configure_nginx() {
 perform_install() {
   output "Starting installation.. this might take a while!"
   dep_install
+  check_database_connection
   install_composer
   ptdl_dl
   install_composer_deps
@@ -428,6 +491,12 @@ perform_install() {
   install_pteroq
   configure_nginx
   [ "$CONFIGURE_LETSENCRYPT" == true ] && letsencrypt
+
+  if [ -n "${INSTALL_SETTINGS:-}" ]; then
+    check_install_settings
+    printf 'CONFIGURE_FIREWALL=%s\nCONFIGURE_LETSENCRYPT=%s\nASSUME_SSL=%s\nFQDN=%s\nEMAIL=%s\nPANEL_MAJOR_VERSION=%s\n' \
+      "$CONFIGURE_FIREWALL" "$CONFIGURE_LETSENCRYPT" "$ASSUME_SSL" "$FQDN" "$email" "$PANEL_MAJOR_VERSION" >"$INSTALL_SETTINGS"
+  fi
 
   return 0
 }

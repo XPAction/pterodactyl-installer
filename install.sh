@@ -1,12 +1,12 @@
 #!/bin/bash
 
-set -e
+set -e -o pipefail
 
 ######################################################################################
 #                                                                                    #
 # Project 'pterodactyl-installer'                                                    #
 #                                                                                    #
-# Copyright (C) 2018 - 2023, Vilhelm Prytz, <vilhelm@prytznet.se>                    #
+# Copyright (C) 2018 - 2026, Vilhelm Prytz, <vilhelm@prytznet.se>                    #
 #                                                                                    #
 #   This program is free software: you can redistribute it and/or modify             #
 #   it under the terms of the GNU General Public License as published by             #
@@ -28,8 +28,8 @@ set -e
 #                                                                                    #
 ######################################################################################
 
-export GITHUB_SOURCE="v0.12.2"
-export SCRIPT_RELEASE="v0.12.2"
+export GITHUB_SOURCE="v1.4.0"
+export SCRIPT_RELEASE="v1.4.0"
 export GITHUB_BASE_URL="https://raw.githubusercontent.com/pterodactyl-installer/pterodactyl-installer"
 
 LOG_PATH="/var/log/pterodactyl-installer.log"
@@ -42,12 +42,17 @@ if ! [ -x "$(command -v curl)" ]; then
 fi
 
 # Always remove lib.sh, before downloading it
-rm -rf /tmp/lib.sh
-curl -sSL -o /tmp/lib.sh "$GITHUB_BASE_URL"/"$GITHUB_SOURCE"/lib/lib.sh
+[ -f /tmp/lib.sh ] && rm -rf /tmp/lib.sh
+curl -fsSL -o /tmp/lib.sh "$GITHUB_BASE_URL"/master/lib/lib.sh
 # shellcheck source=lib/lib.sh
 source /tmp/lib.sh
 
 execute() {
+  if [[ -n $2 ]]; then
+    INSTALL_SETTINGS=$(mktemp)
+    export INSTALL_SETTINGS
+    trap 'rm -f "$INSTALL_SETTINGS"' EXIT
+  fi
   echo -e "\n\n* pterodactyl-installer $(date) \n\n" >>$LOG_PATH
 
   [[ "$1" == *"canary"* ]] && export GITHUB_SOURCE="master" && export SCRIPT_RELEASE="canary"
@@ -57,7 +62,7 @@ execute() {
   if [[ -n $2 ]]; then
     echo -e -n "* Installation of $1 completed. Do you want to proceed to $2 installation? (y/N): "
     read -r CONFIRM
-    if [[ "$CONFIRM" =~ [Yy] ]]; then
+    if is_yes "$CONFIRM"; then
       execute "$2"
     else
       error "Installation of $2 aborted."
@@ -74,11 +79,11 @@ while [ "$done" == false ]; do
     "Install the panel"
     "Install Wings"
     "Install both [0] and [1] on the same machine (wings script runs after panel)"
-    # "Uninstall panel or wings\n"
+    $'Uninstall panel or wings\n'
 
     "Install panel with canary version of the script (the versions that lives in master, may be broken!)"
     "Install Wings with canary version of the script (the versions that lives in master, may be broken!)"
-    "Install both [3] and [4] on the same machine (wings script runs after panel)"
+    "Install both [4] and [5] on the same machine (wings script runs after panel)"
     "Uninstall panel or wings with canary version of the script (the versions that lives in master, may be broken!)"
   )
 
@@ -86,7 +91,7 @@ while [ "$done" == false ]; do
     "panel"
     "wings"
     "panel;wings"
-    # "uninstall"
+    "uninstall"
 
     "panel_canary"
     "wings_canary"
@@ -105,9 +110,13 @@ while [ "$done" == false ]; do
 
   [ -z "$action" ] && error "Input is required" && continue
 
-  valid_input=("$(for ((i = 0; i <= ${#actions[@]} - 1; i += 1)); do echo "${i}"; done)")
-  [[ ! " ${valid_input[*]} " =~ ${action} ]] && error "Invalid option"
-  [[ " ${valid_input[*]} " =~ ${action} ]] && done=true && IFS=";" read -r i1 i2 <<<"${actions[$action]}" && execute "$i1" "$i2"
+  if [[ ! "$action" =~ ^[0-9]$ ]] || (( action >= ${#actions[@]} )); then
+    error "Invalid option"
+    continue
+  fi
+  done=true
+  IFS=";" read -r i1 i2 <<<"${actions[$action]}"
+  execute "$i1" "$i2"
 done
 
 # Remove lib.sh, so next time the script is run the, newest version is downloaded.

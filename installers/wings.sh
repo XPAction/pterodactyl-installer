@@ -1,12 +1,12 @@
 #!/bin/bash
 
-set -e
+set -e -o pipefail
 
 ######################################################################################
 #                                                                                    #
 # Project 'pterodactyl-installer'                                                    #
 #                                                                                    #
-# Copyright (C) 2018 - 2023, Vilhelm Prytz, <vilhelm@prytznet.se>                    #
+# Copyright (C) 2018 - 2026, Vilhelm Prytz, <vilhelm@prytznet.se>                    #
 #                                                                                    #
 #   This program is free software: you can redistribute it and/or modify             #
 #   it under the terms of the GNU General Public License as published by             #
@@ -79,9 +79,7 @@ dep_install() {
     install_packages "ca-certificates gnupg lsb-release"
 
     mkdir -p /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
-
-    [ "$INSTALL_MARIADB" == true ] && [ "$OS_VER_MAJOR" == "18" ] && curl -sS "$MARIADB_URL" | bash
+    curl -fsSL "https://download.docker.com/linux/$OS/gpg" | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
 
     echo \
       "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$OS \
@@ -89,12 +87,24 @@ dep_install() {
     ;;
 
   rocky | almalinux)
-    install_packages "dnf-utils"
-    dnf config-manager --add-repo=https://download.docker.com/linux/centos/docker-ce.repo
+    install_packages "dnf-plugins-core"
+    # Podman and its standalone runc conflict with containerd.io's runtime.
+    if rpm -q podman >/dev/null 2>&1 || rpm -q runc >/dev/null 2>&1; then
+      dnf -y remove podman runc
+    fi
+    if [ "$OS_VER_MAJOR" == "10" ]; then
+      dnf config-manager --add-repo=https://download.docker.com/linux/rhel/docker-ce.repo
+    else
+      dnf config-manager --add-repo=https://download.docker.com/linux/centos/docker-ce.repo
+    fi
 
     [ "$CONFIGURE_LETSENCRYPT" == true ] && install_packages "epel-release"
 
     install_packages "device-mapper-persistent-data lvm2"
+    if [ "$OS_VER_MAJOR" == "10" ] && ! modinfo xt_addrtype >/dev/null 2>&1; then
+      # Docker's iptables backend needs the module for the running kernel.
+      install_packages "kernel-modules-extra-$(uname -r)"
+    fi
     ;;
   esac
 
@@ -117,7 +127,7 @@ ptdl_dl() {
   echo "* Downloading Pterodactyl Wings.. "
 
   mkdir -p /etc/pterodactyl
-  curl -L -o /usr/local/bin/wings "$WINGS_DL_BASE_URL$ARCH"
+  curl -fL -o /usr/local/bin/wings "$WINGS_DL_BASE_URL$ARCH"
 
   chmod u+x /usr/local/bin/wings
 
@@ -127,7 +137,7 @@ ptdl_dl() {
 systemd_file() {
   output "Installing systemd service.."
 
-  curl -o /etc/systemd/system/wings.service "$GITHUB_URL"/configs/wings.service
+  curl -fsSL -o /etc/systemd/system/wings.service "$GITHUB_URL"/configs/wings.service
   systemctl daemon-reload
   systemctl enable wings
 
@@ -140,7 +150,12 @@ firewall_ports() {
   [ "$CONFIGURE_LETSENCRYPT" == true ] && firewall_allow_ports "80 443"
   [ "$CONFIGURE_DB_FIREWALL" == true ] && firewall_allow_ports "3306"
 
-  firewall_allow_ports "22 8080 2022"
+  firewall_allow_ports "22"
+  output "Allowed port 22"
+  firewall_allow_ports "8080"
+  output "Allowed port 8080"
+  firewall_allow_ports "2022"
+  output "Allowed port 2022"
 
   success "Firewall ports opened!"
 }
@@ -149,6 +164,11 @@ letsencrypt() {
   FAILED=false
 
   output "Configuring LetsEncrypt.."
+
+  if [ -f "/etc/letsencrypt/live/$FQDN/fullchain.pem" ] && [ -f "/etc/letsencrypt/live/$FQDN/privkey.pem" ]; then
+    success "Using existing Let's Encrypt certificate."
+    return 0
+  fi
 
   # If user has nginx
   systemctl stop nginx || true
@@ -169,6 +189,8 @@ letsencrypt() {
 configure_mysql() {
   output "Configuring MySQL.."
 
+  valid_database_identifier "$MYSQL_DBHOST_USER"
+  check_database_connection
   create_db_user "$MYSQL_DBHOST_USER" "$MYSQL_DBHOST_PASSWORD" "$MYSQL_DBHOST_HOST"
   grant_all_privileges "*" "$MYSQL_DBHOST_USER" "$MYSQL_DBHOST_HOST"
 
@@ -177,14 +199,14 @@ configure_mysql() {
 
     case "$OS" in
     debian | ubuntu)
-      sed -i 's/127.0.0.1/0.0.0.0/g' /etc/mysql/mariadb.conf.d/50-server.cnf
+      sed -i -E 's/^[#[:space:]]*bind-address[[:space:]]*=.*/bind-address=0.0.0.0/' /etc/mysql/mariadb.conf.d/50-server.cnf
       ;;
     rocky | almalinux)
-      sed -ne 's/^#bind-address=0.0.0.0$/bind-address=0.0.0.0/' /etc/my.cnf.d/mariadb-server.cnf
+      sed -i -E 's/^[#[:space:]]*bind-address[[:space:]]*=.*/bind-address=0.0.0.0/' /etc/my.cnf.d/mariadb-server.cnf
       ;;
     esac
 
-    systemctl restart mysqld
+    systemctl restart mariadb
   fi
 
   success "MySQL configured!"
@@ -193,6 +215,7 @@ configure_mysql() {
 # --------------- Main functions --------------- #
 
 perform_install() {
+  get_latest_versions wings
   output "Installing pterodactyl wings.."
   dep_install
   ptdl_dl
